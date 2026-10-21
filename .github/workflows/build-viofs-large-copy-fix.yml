@@ -68,6 +68,7 @@ jobs:
 
       - name: Build VioFS dependencies and ARM64 binaries
         shell: pwsh
+        working-directory: ${{ github.workspace }}
         run: |
           $ErrorActionPreference = 'Stop'
           $common = @(
@@ -86,12 +87,32 @@ jobs:
           )
 
           foreach ($project in $projects) {
-            if (-not (Test-Path $project.Path)) { throw "Project not found: $($project.Path)" }
-            Write-Host "::group::MSBuild $($project.Path)"
-            & msbuild $project.Path "/p:Configuration=$($project.Configuration)" "/p:Platform=$($project.Platform)" @common
+            $repoRoot = $env:GITHUB_WORKSPACE
+            $relativePath = ([string]$projectFullPath).Replace('/', '\')
+            $projectFullPath = Join-Path $repoRoot $relativePath
+            
+            Write-Host "Checking project: $projectFullPath"
+            
+            if (-not (Test-Path -LiteralPath $projectFullPath -PathType Leaf)) {
+                Write-Host "Current directory: $PWD"
+                Write-Host "GitHub workspace: $repoRoot"
+                Write-Host "Repository root contents:"
+                Get-ChildItem -LiteralPath $repoRoot |
+                    Select-Object Name, Mode
+            
+                Write-Host "Searching for VirtioLib.vcxproj:"
+                Get-ChildItem -LiteralPath $repoRoot `
+                    -Recurse -Filter 'VirtioLib.vcxproj' `
+                    -File -ErrorAction SilentlyContinue |
+                    Select-Object -ExpandProperty FullName
+            
+                throw "Project not found: $projectFullPath"
+            }
+            Write-Host "::group::MSBuild $($projectFullPath)"
+            & msbuild $projectFullPath "/p:Configuration=$($project.Configuration)" "/p:Platform=$($project.Platform)" @common
             $code = $LASTEXITCODE
             Write-Host "::endgroup::"
-            if ($code -ne 0) { throw "MSBuild failed ($code): $($project.Path)" }
+            if ($code -ne 0) { throw "MSBuild failed ($code): $($projectFullPath)" }
           }
 
       - name: Package and test-sign VioFS
