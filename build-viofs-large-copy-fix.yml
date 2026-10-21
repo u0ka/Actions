@@ -1,0 +1,204 @@
+name: Build DroidVM VioFS ARM64 (test-signed)
+
+on:
+  workflow_dispatch:
+    inputs:
+      driver_minor:
+        description: 'Driver version fourth component; must be greater than the installed version (first build: 58001)'
+        required: true
+        default: '58001'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-viofs:
+    # Match the runner/toolchain used by DroidVM's existing ARM64 driver workflow.
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      CONFIG: 'Win11 Release'
+      PLATFORM: 'ARM64'
+      OSMASK: 'Server10_ARM64'
+      CERT_SUBJECT: 'CN=DroidVM Test'
+      PFX_PW: 'droidvm'
+      DRIVER_MINOR: ${{ inputs.driver_minor }}
+
+    steps:
+      - name: Checkout selected branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Install WinFsp SDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msi = Join-Path $env:RUNNER_TEMP 'winfsp-2.1.25156.msi'
+          Invoke-WebRequest -Uri 'https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi' -OutFile $msi
+          $p = Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i', $msi, '/qn', '/norestart', 'ADDLOCAL=ALL') -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "WinFsp SDK installation failed: $($p.ExitCode)" }
+          $header = 'C:\Program Files (x86)\WinFsp\inc\winfsp\winfsp.h'
+          if (-not (Test-Path $header)) { throw "WinFsp SDK header not found: $header" }
+          Write-Host "WinFsp SDK ready: $header"
+
+      - name: Validate inputs and diagnose WDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:DRIVER_MINOR -notmatch '^\d{1,5}$') { throw 'driver_minor must be an integer from 0 to 65535.' }
+          $minor = [int]$env:DRIVER_MINOR
+          if ($minor -lt 58001 -or $minor -gt 65535) { throw 'driver_minor must be between 58001 and 65535.' }
+          Write-Host "Requested driver version: 100.6.101.$minor"
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (Test-Path $vswhere) { & $vswhere -all -products '*' -format json | Write-Host }
+          $kitRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+          $kit = Get-ChildItem $kitRoot -Directory -ErrorAction Stop |
+            Where-Object { $_.Name -match '^10\.' } | Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $kit) { throw "Windows SDK/WDK bin folder not found under $kitRoot" }
+          $kitbin = $kit.FullName
+          foreach ($tool in @('x64\signtool.exe', 'x86\inf2cat.exe', 'x86\stampinf.exe')) {
+            if (-not (Test-Path (Join-Path $kitbin $tool))) { throw "Missing WDK tool: $(Join-Path $kitbin $tool)" }
+          }
+          "KITBIN=$kitbin" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build VioFS dependencies and ARM64 binaries
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $common = @(
+            '/m',
+            '/p:ApiValidator_Enable=false',
+            '/p:SpectreMitigation=false',
+            '/p:SignMode=Off',
+            "/p:_BUILD_MINOR_VERSION_=$env:DRIVER_MINOR"
+          )
+
+          $projects = @(
+            @{ Path='VirtIO/VirtioLib.vcxproj';          Configuration='Win11 Release'; Platform='ARM64' },
+            @{ Path='VirtIO/WDF/VirtioLib-WDF.vcxproj';  Configuration='Win11 Release'; Platform='ARM64' },
+            @{ Path='viofs/pci/viofs.vcxproj';           Configuration='Win11 Release'; Platform='ARM64' },
+            @{ Path='viofs/svc/virtiofs.vcxproj';        Configuration='Win11 Release'; Platform='ARM64' }
+          )
+
+          foreach ($project in $projects) {
+            if (-not (Test-Path $project.Path)) { throw "Project not found: $($project.Path)" }
+            Write-Host "::group::MSBuild $($project.Path)"
+            & msbuild $project.Path "/p:Configuration=$($project.Configuration)" "/p:Platform=$($project.Platform)" @common
+            $code = $LASTEXITCODE
+            Write-Host "::endgroup::"
+            if ($code -ne 0) { throw "MSBuild failed ($code): $($project.Path)" }
+          }
+
+      - name: Package and test-sign VioFS
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $kitbin = $env:KITBIN
+          $signtool = Join-Path $kitbin 'x64\signtool.exe'
+          $inf2cat = Join-Path $kitbin 'x86\inf2cat.exe'
+          $stampinf = Join-Path $kitbin 'x86\stampinf.exe'
+
+          $out = Join-Path $PWD 'out'
+          $dest = Join-Path $out 'drivers\viofs'
+          New-Item -ItemType Directory -Path $dest -Force | Out-Null
+
+          function Find-Arm64BuildFile([string]$Root, [string]$Name) {
+            $all = Get-ChildItem -Path $Root -Recurse -File -Filter $Name -ErrorAction SilentlyContinue
+            $arm = $all | Where-Object { $_.FullName -match '(?i)ARM64' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($arm) { return $arm }
+            return $all | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          }
+
+          $sys = Find-Arm64BuildFile 'viofs' 'viofs.sys'
+          if (-not $sys) { throw 'Build output viofs.sys not found.' }
+          Copy-Item $sys.FullName (Join-Path $dest 'viofs.sys') -Force
+          Write-Host "Using driver: $($sys.FullName)"
+
+          $exe = Find-Arm64BuildFile 'viofs' 'virtiofs.exe'
+          if (-not $exe) { throw 'Build output virtiofs.exe not found.' }
+          Copy-Item $exe.FullName (Join-Path $dest 'virtiofs.exe') -Force
+          Write-Host "Using service: $($exe.FullName)"
+
+          $inf = Get-ChildItem -Path 'viofs' -Recurse -File -Filter 'viofs.inf' -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notmatch '(?i)\\(obj|Debug|Release)\\' } |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $inf) {
+            $inx = Get-ChildItem -Path 'viofs' -Recurse -File -Filter 'viofs.inx' -ErrorAction SilentlyContinue |
+              Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($inx) { Copy-Item $inx.FullName (Join-Path $dest 'viofs.inf') -Force }
+            else { throw 'Neither viofs.inf nor viofs.inx was found.' }
+          } else {
+            Copy-Item $inf.FullName (Join-Path $dest 'viofs.inf') -Force
+          }
+
+          # Resolve common INX placeholders if the selected INF came from a source template.
+          $infPath = Join-Path $dest 'viofs.inf'
+          $raw = Get-Content -LiteralPath $infPath -Raw
+          $map = [ordered]@{
+            '_INX_SUBSYS_VENDOR_ID'              = '1AF4'
+            'INX_PLATFORM_DRIVERS_DIR'           = '13'
+            'INX_BASE_ON_SYSTEM_ROOT_DRIVER_DIR' = '%13%'
+            'INX_NETKVM_DMAREMAP'                = '2'
+            'INX_NETKVM_SEPARATE_TAIL'           = '1'
+            'INX_COMPANY'                        = 'Red Hat, Inc.'
+            'INX_PREFIX_VENDOR'                  = 'Red Hat '
+            'INX_PREFIX_VIRTIO'                  = ''
+            'INX_PREFIX_QEMU'                    = ''
+            'INX_COPYRIGHT_1'                    = 'Copyright (c) Red Hat Inc.'
+            'INX_COPYRIGHT_2'                    = ''
+          }
+          foreach ($key in $map.Keys) { $raw = $raw.Replace($key, [string]$map[$key]) }
+          Set-Content -LiteralPath $infPath -Value $raw -NoNewline -Encoding utf8
+          if ((Get-Content -LiteralPath $infPath -Raw) -match '\$ARCH\$|\$KMDFVERSION\$') {
+            & $stampinf -f $infPath -a ARM64 -k 1.15 -d '*' -v '*'
+            if ($LASTEXITCODE -ne 0) { throw "stampinf failed: $LASTEXITCODE" }
+          }
+          if ((Get-Content -LiteralPath $infPath -Raw) -match 'INX_[A-Z_]+') {
+            throw 'viofs.inf still contains unexpanded INX_* tokens; refusing to sign an invalid package.'
+          }
+
+          # Create a per-run self-signed code-signing certificate. The matching CER is included in the artifact.
+          $pfxPath = Join-Path $out 'DroidVM_Test.pfx'
+          $cerPath = Join-Path $out 'DroidVM_Test.cer'
+          $securePw = ConvertTo-SecureString $env:PFX_PW -AsPlainText -Force
+          $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject $env:CERT_SUBJECT `
+            -CertStoreLocation 'Cert:\CurrentUser\My' -KeyExportPolicy Exportable `
+            -KeyUsage DigitalSignature -NotAfter (Get-Date).AddYears(5)
+          Export-PfxCertificate -Cert $cert -FilePath $pfxPath -Password $securePw | Out-Null
+          Export-Certificate -Cert $cert -FilePath $cerPath | Out-Null
+          Write-Host "Signing with temporary test certificate: $($cert.Subject) / $($cert.Thumbprint)"
+
+          foreach ($name in @('viofs.sys', 'virtiofs.exe')) {
+            $file = Join-Path $dest $name
+            & $signtool sign /fd SHA256 /f $pfxPath /p $env:PFX_PW $file
+            if ($LASTEXITCODE -ne 0) { throw "signtool failed signing ${name}: $LASTEXITCODE" }
+          }
+
+          & $inf2cat "/driver:$dest" "/os:$env:OSMASK"
+          if ($LASTEXITCODE -ne 0) { throw "inf2cat failed: $LASTEXITCODE" }
+          $cats = Get-ChildItem -Path $dest -Filter '*.cat' -File
+          if (-not $cats) { throw 'inf2cat succeeded but no .cat was generated.' }
+          foreach ($cat in $cats) {
+            & $signtool sign /fd SHA256 /f $pfxPath /p $env:PFX_PW $cat.FullName
+            if ($LASTEXITCODE -ne 0) { throw "signtool failed signing $($cat.Name): $LASTEXITCODE" }
+          }
+
+          # Never upload the private signing key.
+          Remove-Item -LiteralPath $pfxPath -Force
+          Write-Host '=== VioFS package ==='
+          Get-ChildItem -Path $out -Recurse -File | Select-Object FullName, Length | Format-Table -AutoSize | Out-String | Write-Host
+          "Driver version target: 100.6.101.$env:DRIVER_MINOR" | Out-File -FilePath (Join-Path $out 'BUILD-INFO.txt') -Encoding utf8
+          "Source commit: $env:GITHUB_SHA" | Out-File -FilePath (Join-Path $out 'BUILD-INFO.txt') -Append -Encoding utf8
+
+      - name: Upload signed test driver package
+        uses: actions/upload-artifact@v4
+        with:
+          name: droidvm-viofs-arm64-${{ inputs.driver_minor }}
+          path: out/**
+          if-no-files-found: error
+          retention-days: 14
