@@ -3,6 +3,15 @@ name: Build DroidVM VioFS ARM64 (test-signed)
 on:
   workflow_dispatch:
     inputs:
+      source_repository:
+        description: 'Repository containing DroidVM driver source and the VioFS fix (OWNER/REPO; use your fork)'
+        required: true
+        type: string
+      source_ref:
+        description: 'Branch, tag, or commit containing the fix'
+        required: true
+        default: 'fix-viofs-large-copy'
+        type: string
       driver_minor:
         description: 'Driver version fourth component; must be greater than the installed version (first build: 58001)'
         required: true
@@ -14,7 +23,6 @@ permissions:
 
 jobs:
   build-viofs:
-    # Match the runner/toolchain used by DroidVM's existing ARM64 driver workflow.
     runs-on: windows-2022
     timeout-minutes: 90
     env:
@@ -26,10 +34,52 @@ jobs:
       DRIVER_MINOR: ${{ inputs.driver_minor }}
 
     steps:
-      - name: Checkout selected branch
+      # The workflow may live in a separate repository (for example, a repo named Actions).
+      # Always check out the actual DroidVM driver source into ./source.
+      - name: Checkout DroidVM driver source and fix branch
         uses: actions/checkout@v4
         with:
+          repository: ${{ inputs.source_repository }}
+          ref: ${{ inputs.source_ref }}
+          path: source
           fetch-depth: 0
+          # For a public fork, the default token is normally sufficient. If the source repo is
+          # private, add a SOURCE_REPO_TOKEN secret with read access to that repository.
+          token: ${{ secrets.SOURCE_REPO_TOKEN || github.token }}
+
+      - name: Verify source checkout
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $src = Join-Path $env:GITHUB_WORKSPACE 'source'
+          Write-Host "Workflow repository: $env:GITHUB_REPOSITORY"
+          Write-Host "Source repository input: ${{ inputs.source_repository }}"
+          Write-Host "Source ref input: ${{ inputs.source_ref }}"
+          Write-Host "Source directory: $src"
+
+          if (-not (Test-Path -LiteralPath $src -PathType Container)) {
+            throw "Source checkout directory does not exist: $src"
+          }
+          $required = @(
+            'VirtIO\VirtioLib.vcxproj',
+            'VirtIO\WDF\VirtioLib-WDF.vcxproj',
+            'viofs\pci\viofs.vcxproj',
+            'viofs\svc\virtiofs.vcxproj',
+            'viofs\pci\viofs.inf'
+          )
+          foreach ($rel in $required) {
+            $candidate = Join-Path $src $rel
+            if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+              Write-Host 'Top-level source contents:'
+              Get-ChildItem -LiteralPath $src -Force | Select-Object Name, Mode | Format-Table -AutoSize | Out-String | Write-Host
+              throw "Required source file is missing: $candidate. Make sure source_repository points to your gunyah-guest-drivers-windows fork and source_ref points to the branch containing the source/fix."
+            }
+          }
+          $commit = (& git -C $src rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or -not $commit) { throw 'Could not determine source commit.' }
+          Write-Host "Source commit: $commit"
+          & git -C $src log -1 --oneline
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read source commit log.' }
 
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@v2
@@ -43,34 +93,43 @@ jobs:
           $p = Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i', $msi, '/qn', '/norestart', 'ADDLOCAL=ALL') -Wait -PassThru
           if ($p.ExitCode -ne 0) { throw "WinFsp SDK installation failed: $($p.ExitCode)" }
           $header = 'C:\Program Files (x86)\WinFsp\inc\winfsp\winfsp.h'
-          if (-not (Test-Path $header)) { throw "WinFsp SDK header not found: $header" }
+          if (-not (Test-Path -LiteralPath $header)) { throw "WinFsp SDK header not found: $header" }
           Write-Host "WinFsp SDK ready: $header"
 
       - name: Validate inputs and diagnose WDK
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          if ($env:DRIVER_MINOR -notmatch '^\d{1,5}$') { throw 'driver_minor must be an integer from 0 to 65535.' }
+          if ($env:DRIVER_MINOR -notmatch '^\d{1,5}$') { throw 'driver_minor must be an integer from 58001 to 65535.' }
           $minor = [int]$env:DRIVER_MINOR
           if ($minor -lt 58001 -or $minor -gt 65535) { throw 'driver_minor must be between 58001 and 65535.' }
           Write-Host "Requested driver version: 100.6.101.$minor"
+
           $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-          if (Test-Path $vswhere) { & $vswhere -all -products '*' -format json | Write-Host }
+          if (Test-Path -LiteralPath $vswhere) {
+            & $vswhere -all -products '*' -format json | Write-Host
+          }
           $kitRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
-          $kit = Get-ChildItem $kitRoot -Directory -ErrorAction Stop |
-            Where-Object { $_.Name -match '^10\.' } | Sort-Object Name -Descending | Select-Object -First 1
+          $kit = Get-ChildItem -LiteralPath $kitRoot -Directory -ErrorAction Stop |
+            Where-Object { $_.Name -match '^10\.' } |
+            Sort-Object Name -Descending |
+            Select-Object -First 1
           if (-not $kit) { throw "Windows SDK/WDK bin folder not found under $kitRoot" }
           $kitbin = $kit.FullName
           foreach ($tool in @('x64\signtool.exe', 'x86\inf2cat.exe', 'x86\stampinf.exe')) {
-            if (-not (Test-Path (Join-Path $kitbin $tool))) { throw "Missing WDK tool: $(Join-Path $kitbin $tool)" }
+            $toolPath = Join-Path $kitbin $tool
+            if (-not (Test-Path -LiteralPath $toolPath)) { throw "Missing WDK tool: $toolPath" }
           }
           "KITBIN=$kitbin" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Build VioFS dependencies and ARM64 binaries
         shell: pwsh
-        working-directory: ${{ github.workspace }}
+        working-directory: ${{ github.workspace }}/source
         run: |
           $ErrorActionPreference = 'Stop'
+          # Do not use GITHUB_WORKSPACE here: the driver repository is checked out under ./source.
+          $repoRoot = (Get-Location).Path
+          Write-Host "Driver source root: $repoRoot"
           $common = @(
             '/m',
             '/p:ApiValidator_Enable=false',
@@ -87,36 +146,29 @@ jobs:
           )
 
           foreach ($project in $projects) {
-            $repoRoot = $env:GITHUB_WORKSPACE
-            $relativePath = ([string]$projectFullPath).Replace('/', '\')
+            # IMPORTANT: resolve the path from $project.Path (not the not-yet-initialized $projectFullPath).
+            $relativePath = ([string]$project.Path).Replace('/', '\')
             $projectFullPath = Join-Path $repoRoot $relativePath
-            
             Write-Host "Checking project: $projectFullPath"
-            
+
             if (-not (Test-Path -LiteralPath $projectFullPath -PathType Leaf)) {
-                Write-Host "Current directory: $PWD"
-                Write-Host "GitHub workspace: $repoRoot"
-                Write-Host "Repository root contents:"
-                Get-ChildItem -LiteralPath $repoRoot |
-                    Select-Object Name, Mode
-            
-                Write-Host "Searching for VirtioLib.vcxproj:"
-                Get-ChildItem -LiteralPath $repoRoot `
-                    -Recurse -Filter 'VirtioLib.vcxproj' `
-                    -File -ErrorAction SilentlyContinue |
-                    Select-Object -ExpandProperty FullName
-            
-                throw "Project not found: $projectFullPath"
+              Write-Host "Current directory: $PWD"
+              Write-Host "Source root: $repoRoot"
+              Write-Host 'Repository root contents:'
+              Get-ChildItem -LiteralPath $repoRoot -Force | Select-Object Name, Mode | Format-Table -AutoSize | Out-String | Write-Host
+              throw "Project not found: $projectFullPath"
             }
-            Write-Host "::group::MSBuild $($projectFullPath)"
+
+            Write-Host "::group::MSBuild $relativePath"
             & msbuild $projectFullPath "/p:Configuration=$($project.Configuration)" "/p:Platform=$($project.Platform)" @common
             $code = $LASTEXITCODE
-            Write-Host "::endgroup::"
-            if ($code -ne 0) { throw "MSBuild failed ($code): $($projectFullPath)" }
+            Write-Host '::endgroup::'
+            if ($code -ne 0) { throw "MSBuild failed ($code): $projectFullPath" }
           }
 
       - name: Package and test-sign VioFS
         shell: pwsh
+        working-directory: ${{ github.workspace }}/source
         run: |
           $ErrorActionPreference = 'Stop'
           $kitbin = $env:KITBIN
@@ -124,12 +176,12 @@ jobs:
           $inf2cat = Join-Path $kitbin 'x86\inf2cat.exe'
           $stampinf = Join-Path $kitbin 'x86\stampinf.exe'
 
-          $out = Join-Path $PWD 'out'
+          $out = Join-Path (Get-Location).Path 'out'
           $dest = Join-Path $out 'drivers\viofs'
           New-Item -ItemType Directory -Path $dest -Force | Out-Null
 
           function Find-Arm64BuildFile([string]$Root, [string]$Name) {
-            $all = Get-ChildItem -Path $Root -Recurse -File -Filter $Name -ErrorAction SilentlyContinue
+            $all = Get-ChildItem -LiteralPath $Root -Recurse -File -Filter $Name -ErrorAction SilentlyContinue
             $arm = $all | Where-Object { $_.FullName -match '(?i)ARM64' } | Sort-Object LastWriteTime -Descending | Select-Object -First 1
             if ($arm) { return $arm }
             return $all | Sort-Object LastWriteTime -Descending | Select-Object -First 1
@@ -137,27 +189,27 @@ jobs:
 
           $sys = Find-Arm64BuildFile 'viofs' 'viofs.sys'
           if (-not $sys) { throw 'Build output viofs.sys not found.' }
-          Copy-Item $sys.FullName (Join-Path $dest 'viofs.sys') -Force
+          Copy-Item -LiteralPath $sys.FullName -Destination (Join-Path $dest 'viofs.sys') -Force
           Write-Host "Using driver: $($sys.FullName)"
 
           $exe = Find-Arm64BuildFile 'viofs' 'virtiofs.exe'
           if (-not $exe) { throw 'Build output virtiofs.exe not found.' }
-          Copy-Item $exe.FullName (Join-Path $dest 'virtiofs.exe') -Force
+          Copy-Item -LiteralPath $exe.FullName -Destination (Join-Path $dest 'virtiofs.exe') -Force
           Write-Host "Using service: $($exe.FullName)"
 
-          $inf = Get-ChildItem -Path 'viofs' -Recurse -File -Filter 'viofs.inf' -ErrorAction SilentlyContinue |
+          $inf = Get-ChildItem -LiteralPath 'viofs' -Recurse -File -Filter 'viofs.inf' -ErrorAction SilentlyContinue |
             Where-Object { $_.FullName -notmatch '(?i)\\(obj|Debug|Release)\\' } |
             Sort-Object LastWriteTime -Descending | Select-Object -First 1
           if (-not $inf) {
-            $inx = Get-ChildItem -Path 'viofs' -Recurse -File -Filter 'viofs.inx' -ErrorAction SilentlyContinue |
+            $inx = Get-ChildItem -LiteralPath 'viofs' -Recurse -File -Filter 'viofs.inx' -ErrorAction SilentlyContinue |
               Sort-Object LastWriteTime -Descending | Select-Object -First 1
-            if ($inx) { Copy-Item $inx.FullName (Join-Path $dest 'viofs.inf') -Force }
+            if ($inx) { Copy-Item -LiteralPath $inx.FullName -Destination (Join-Path $dest 'viofs.inf') -Force }
             else { throw 'Neither viofs.inf nor viofs.inx was found.' }
           } else {
-            Copy-Item $inf.FullName (Join-Path $dest 'viofs.inf') -Force
+            Copy-Item -LiteralPath $inf.FullName -Destination (Join-Path $dest 'viofs.inf') -Force
           }
 
-          # Resolve common INX placeholders if the selected INF came from a source template.
+          # Expand source INX tokens. Keep this limited to the known DroidVM/virtio-win tokens.
           $infPath = Join-Path $dest 'viofs.inf'
           $raw = Get-Content -LiteralPath $infPath -Raw
           $map = [ordered]@{
@@ -175,6 +227,7 @@ jobs:
           }
           foreach ($key in $map.Keys) { $raw = $raw.Replace($key, [string]$map[$key]) }
           Set-Content -LiteralPath $infPath -Value $raw -NoNewline -Encoding utf8
+
           if ((Get-Content -LiteralPath $infPath -Raw) -match '\$ARCH\$|\$KMDFVERSION\$') {
             & $stampinf -f $infPath -a ARM64 -k 1.15 -d '*' -v '*'
             if ($LASTEXITCODE -ne 0) { throw "stampinf failed: $LASTEXITCODE" }
@@ -182,8 +235,11 @@ jobs:
           if ((Get-Content -LiteralPath $infPath -Raw) -match 'INX_[A-Z_]+') {
             throw 'viofs.inf still contains unexpanded INX_* tokens; refusing to sign an invalid package.'
           }
+          if ((Get-Content -LiteralPath $infPath -Raw) -match '\$ARCH\$|\$KMDFVERSION\$') {
+            throw 'viofs.inf still contains unexpanded $ARCH$ or $KMDFVERSION$ tokens after stampinf.'
+          }
 
-          # Create a per-run self-signed code-signing certificate. The matching CER is included in the artifact.
+          # Create a per-run self-signed test certificate; the matching CER is included in this artifact.
           $pfxPath = Join-Path $out 'DroidVM_Test.pfx'
           $cerPath = Join-Path $out 'DroidVM_Test.cer'
           $securePw = ConvertTo-SecureString $env:PFX_PW -AsPlainText -Force
@@ -202,7 +258,7 @@ jobs:
 
           & $inf2cat "/driver:$dest" "/os:$env:OSMASK"
           if ($LASTEXITCODE -ne 0) { throw "inf2cat failed: $LASTEXITCODE" }
-          $cats = Get-ChildItem -Path $dest -Filter '*.cat' -File
+          $cats = Get-ChildItem -LiteralPath $dest -Filter '*.cat' -File
           if (-not $cats) { throw 'inf2cat succeeded but no .cat was generated.' }
           foreach ($cat in $cats) {
             & $signtool sign /fd SHA256 /f $pfxPath /p $env:PFX_PW $cat.FullName
@@ -211,15 +267,17 @@ jobs:
 
           # Never upload the private signing key.
           Remove-Item -LiteralPath $pfxPath -Force
-          Write-Host '=== VioFS package ==='
-          Get-ChildItem -Path $out -Recurse -File | Select-Object FullName, Length | Format-Table -AutoSize | Out-String | Write-Host
           "Driver version target: 100.6.101.$env:DRIVER_MINOR" | Out-File -FilePath (Join-Path $out 'BUILD-INFO.txt') -Encoding utf8
-          "Source commit: $env:GITHUB_SHA" | Out-File -FilePath (Join-Path $out 'BUILD-INFO.txt') -Append -Encoding utf8
+          "Source repository: ${{ inputs.source_repository }}" | Out-File -FilePath (Join-Path $out 'BUILD-INFO.txt') -Append -Encoding utf8
+          "Source ref: ${{ inputs.source_ref }}" | Out-File -FilePath (Join-Path $out 'BUILD-INFO.txt') -Append -Encoding utf8
+          "Source commit: $((git rev-parse HEAD).Trim())" | Out-File -FilePath (Join-Path $out 'BUILD-INFO.txt') -Append -Encoding utf8
+          Write-Host '=== VioFS package ==='
+          Get-ChildItem -LiteralPath $out -Recurse -File | Select-Object FullName, Length | Format-Table -AutoSize | Out-String | Write-Host
 
       - name: Upload signed test driver package
         uses: actions/upload-artifact@v4
         with:
           name: droidvm-viofs-arm64-${{ inputs.driver_minor }}
-          path: out/**
+          path: source/out/**
           if-no-files-found: error
           retention-days: 14
